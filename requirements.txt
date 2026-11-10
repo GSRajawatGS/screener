@@ -1,2 +1,5 @@
 feedparser
 yfinance
+pandas
+requests
+streamlit
