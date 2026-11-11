@@ -6,6 +6,8 @@ Universe : Nifty 50, your own list, or ALL stocks above a market-cap cut-off (de
 Tab 1  Screener : technical score + multi-source news score (Moneycontrol, ET, BS,
                   Mint RSS, Google News, Yahoo) + optional Groq AI read of the
                   headlines -> entry, stop-loss, target, position size.
+Tab 3  Orders   : turns the candidates into an order sheet for the capital you choose (quantities,
+                  buy limit, stop, target, cash and risk limits). Nothing is sent to a broker.
 Tab 2  Backtest : replays the technical rules on 2-5 years of history, with next-day
                   open entries, stop/target simulation, costs, score buckets,
                   stability check and an optional stop/target sweep.
@@ -106,6 +108,14 @@ POS_RE = [(re.compile(r"\b" + re.escape(k)), w) for k, w in POS.items()]
 NEG_RE = [(re.compile(r"\b" + re.escape(k)), w) for k, w in NEG.items()]
 RED_RE = [re.compile(r"\b" + re.escape(k)) for k in RED_FLAGS]
 TAG_RE = {k: re.compile(v) for k, v in TAGS.items()}
+
+
+def show_df(df, **kw):
+    """st.dataframe that works on both older and newer Streamlit versions."""
+    try:
+        st.dataframe(df, width="stretch", **kw)
+    except Exception:
+        st.dataframe(df, use_container_width=True, **kw)
 
 
 # ------------------------------------------------------------------- news fetching
@@ -539,9 +549,6 @@ def analyse(symbol: str, df: pd.DataFrame, nifty_ret5: pd.Series, p: dict):
     sl_dist = min(p["atr_mult"] * atr, close * p["max_sl_pct"] / 100)
     entry, stop = close, tick(close - sl_dist)
     target = tick(entry + p["rr"] * sl_dist)
-    rps = entry - stop
-    qty = math.floor(p["capital"] * p["risk_pct"] / 100 / rps) if rps > 0 else 0
-    qty = min(qty, math.floor(p["capital"] * p["max_alloc_pct"] / 100 / entry))
     return {
         "Symbol": symbol, "Score": int(last.Tech), "Close": round(close, 2),
         "Chg%": round((close / float(prev.Close) - 1) * 100, 2),
@@ -550,7 +557,7 @@ def analyse(symbol: str, df: pd.DataFrame, nifty_ret5: pd.Series, p: dict):
         "Stop": stop, "Target": target,
         "SL%": round((entry - stop) / entry * 100, 2),
         "Tgt%": round((target - entry) / entry * 100, 2),
-        "Qty": qty, "Risk₹": round(qty * rps), "Setup": setup_labels(last), "_df": ind,
+        "Setup": setup_labels(last), "_df": ind,
     }
 
 
@@ -681,19 +688,19 @@ def render_backtest(out: dict):
     st.line_chart(pd.DataFrame({"Cumulative R": t.R.cumsum().values}, index=range(1, len(t) + 1)))
     c1, c2 = st.columns(2)
     c1.subheader("By technical score")
-    c1.dataframe(out["buckets"], use_container_width=True)
+    c1.dataframe(out["buckets"])
     c2.subheader("Stability (first vs second half)")
-    c2.dataframe(out["halves"], use_container_width=True)
+    c2.dataframe(out["halves"])
     st.subheader("How trades ended")
-    st.dataframe(out["reasons"], use_container_width=True)
+    show_df(out["reasons"])
     if "sweep" in out:
         st.subheader("Stop / target sweep")
-        st.dataframe(out["sweep"], use_container_width=True, hide_index=True)
+        show_df(out["sweep"], hide_index=True)
         st.caption("Picking the single best cell is curve-fitting. Prefer a region where neighbouring "
                    "cells are also positive.")
     st.subheader("All trades")
     show = ["Symbol", "SignalDate", "Score", "Entry", "Stop", "Target", "Exit", "Reason", "Days", "Ret%", "R"]
-    st.dataframe(t[show], use_container_width=True, hide_index=True)
+    show_df(t[show], hide_index=True)
     st.download_button("Download trades CSV", t[show].to_csv(index=False).encode(), "backtest_trades.csv", "text/csv")
     st.warning("Limits: current Nifty 50 members only (survivorship bias flatters results); technical rules "
                "only, because historical headlines are not available; trades are treated independently with "
@@ -837,8 +844,8 @@ def render_scan(out: dict):
     st.subheader(f"Candidates ({len(picks)} of {len(res)} scored ≥ {out['min_score']})")
     st.caption(f"News is checked only for the top {out['news_top_n']} technical names; others show Buzz empty.")
     cols = ["Symbol", "Score", "Tech", "News", "Buzz", "Catalysts", "Flag", "AI", "Close", "Chg%", "5d%", "RSI",
-            "VolX", "Entry", "MaxChase", "Stop", "Target", "SL%", "Tgt%", "Qty", "Risk₹", "Setup"]
-    st.dataframe(picks[cols], use_container_width=True, hide_index=True)
+            "VolX", "Entry", "MaxChase", "Stop", "Target", "SL%", "Tgt%", "Setup"]
+    show_df(picks[cols], hide_index=True)
     st.download_button("Download CSV", picks[cols].to_csv(index=False).encode(), "swing_candidates.csv", "text/csv")
 
     st.subheader("Charts, headlines and AI read (top 5)")
@@ -863,6 +870,110 @@ def render_scan(out: dict):
 - Prefer a *fresh* positive catalyst (earnings beat, order win, upgrade) meeting a clean chart.
 - Exit at *Stop* without negotiating. Book part at *Target* and trail the rest.
 - Time-stop: if nothing happens in about 8-10 sessions, exit. Check result dates and ex-dates in your window.
+""")
+
+
+# ------------------------------------------------------------------------ orders
+def build_orders(picks: pd.DataFrame, o: dict):
+    """Allocate capital across candidates in score order. Quantity is limited by risk per trade,
+    max % per stock, cash left and the total portfolio risk cap. Returns (orders, skipped, summary)."""
+    orders, skipped = [], []
+    avail = o["capital"] * (1 - o["reserve_pct"] / 100)
+    risk_left = o["capital"] * o["risk_cap_pct"] / 100
+    for _, r in picks.iterrows():
+        sym = r.Symbol
+        if len(orders) >= o["max_positions"]:
+            skipped.append((sym, "Max positions reached"))
+            continue
+        price = tick(float(r.MaxChase)) if o["entry_mode"] == "max_chase" else tick(float(r.Entry))
+        stop, target = float(r.Stop), float(r.Target)
+        rps = price - stop
+        if rps <= 0 or target <= price:
+            skipped.append((sym, "Stop/target invalid at this buy price"))
+            continue
+        limits = {
+            "risk per trade": o["capital"] * o["risk_pct"] / 100 / rps,
+            "max % per stock": o["capital"] * o["max_alloc_pct"] / 100 / price,
+            "cash available": avail / price,
+            "portfolio risk cap": risk_left / rps,
+        }
+        binding = min(limits, key=limits.get)
+        qty = math.floor(limits[binding])
+        if qty < 1:
+            skipped.append((sym, f"Cannot buy 1 share of a ₹{price:,.0f} stock within '{binding}'"))
+            continue
+        value = qty * price
+        if value < o["min_order_value"]:
+            skipped.append((sym, f"Order value ₹{value:,.0f} below minimum"))
+            continue
+        avail -= value
+        risk_left -= qty * rps
+        orders.append({
+            "Symbol": sym, "Side": "BUY", "Qty": qty, "Buy limit": price, "Stop trigger": round(stop, 2),
+            "Stop limit": tick(stop * (1 - o["sl_buffer_pct"] / 100)), "Target": round(target, 2),
+            "Value ₹": round(value), "% capital": round(value / o["capital"] * 100, 1),
+            "Risk ₹": round(qty * rps), "Reward ₹": round(qty * (target - price)),
+            "R:R": round((target - price) / rps, 2), "Limited by": binding, "Score": int(r.Score),
+        })
+    df = pd.DataFrame(orders)
+    dep = float(df["Value ₹"].sum()) if len(df) else 0.0
+    risk = float(df["Risk ₹"].sum()) if len(df) else 0.0
+    reward = float(df["Reward ₹"].sum()) if len(df) else 0.0
+    summary = {"deployed": dep, "cash_left": o["capital"] - dep, "risk": risk, "reward": reward,
+               "positions": len(df), "capital": o["capital"]}
+    return df, skipped, summary
+
+
+def order_text(df: pd.DataFrame) -> str:
+    return "\n".join(f"BUY {r.Qty} {r.Symbol} @ {r['Buy limit']:.2f}  ->  after fill: SL {r['Stop trigger']:.2f}"
+                     f" (limit {r['Stop limit']:.2f}) / TARGET {r.Target:.2f}" for _, r in df.iterrows())
+
+
+def render_orders(picks: pd.DataFrame):
+    st.write("Builds an order sheet from the screener's candidates for the capital you choose. "
+             "**Nothing is sent to a broker**; you place the orders yourself.")
+    c = st.columns(4)
+    cap = c[0].number_input("Capital (₹)", 10000, 1000000000, 500000, step=50000, key="o_cap")
+    risk = c[1].slider("Risk per trade (% of capital)", 0.25, 2.0, 0.75, 0.25, key="o_risk")
+    alloc = c[2].slider("Max per stock (% of capital)", 5, 50, 20, 5, key="o_alloc")
+    maxpos = c[3].slider("Max positions", 1, 20, 5, key="o_maxpos")
+    d = st.columns(5)
+    reserve = d[0].slider("Cash reserve (%)", 0, 50, 10, 5, key="o_res")
+    rcap = d[1].slider("Total risk cap (% of capital)", 1.0, 10.0, 4.0, 0.5, key="o_rcap")
+    mode = d[2].selectbox("Buy limit price", ["Max-chase price (skips big gap-ups)", "Last close"], key="o_mode")
+    buf = d[3].slider("Stop-limit buffer (%)", 0.0, 2.0, 0.5, 0.25, key="o_buf")
+    minv = d[4].number_input("Min order value (₹)", 0, 100000, 5000, step=1000, key="o_min")
+    chosen = st.multiselect("Stocks to include (kept in score order)", list(picks.Symbol), default=list(picks.Symbol))
+    sel = picks[picks.Symbol.isin(chosen)]
+    orders, skipped, sm = build_orders(sel, dict(
+        capital=cap, risk_pct=risk, max_alloc_pct=alloc, max_positions=maxpos, reserve_pct=reserve,
+        risk_cap_pct=rcap, entry_mode="max_chase" if mode.startswith("Max") else "close",
+        sl_buffer_pct=buf, min_order_value=minv))
+    if orders.empty:
+        st.warning("No orders fit these limits. Raise capital or the per-stock limit, or lower the minimum order value.")
+    else:
+        m = st.columns(5)
+        m[0].metric("Positions", sm["positions"])
+        m[1].metric("Deployed", f"₹{sm['deployed']:,.0f}", f"{sm['deployed'] / cap * 100:.0f}% of capital", delta_color="off")
+        m[2].metric("Cash left", f"₹{sm['cash_left']:,.0f}")
+        m[3].metric("Loss if all stops hit", f"₹{sm['risk']:,.0f}", f"{sm['risk'] / cap * 100:.1f}% of capital", delta_color="off")
+        m[4].metric("Gain if all targets hit", f"₹{sm['reward']:,.0f}")
+        show_df(orders, hide_index=True)
+        st.download_button("Download order sheet CSV", orders.to_csv(index=False).encode(), "order_sheet.csv", "text/csv")
+        st.subheader("Copy-paste list")
+        st.code(order_text(orders), language="text")
+    if skipped:
+        with st.expander(f"Skipped ({len(skipped)})"):
+            for sym, why in skipped:
+                st.write(f"**{sym}**: {why}")
+    st.markdown("""
+**How to place these**
+- Prices come from the last close. Re-check them before the market opens; if a stock has moved a lot, recompute or skip it.
+- Place the **buy limit** orders first. Once a buy is filled, set the **stop and target**. For delivery trades, a
+  broker's GTT / OCO order (stop + target as a pair) does this; intraday-style bracket orders differ by broker.
+- Stop-limit orders can be skipped in a fast gap-down, so the real loss can exceed the figure shown.
+- Brokerage, taxes and slippage are not included. Position sizes round **down** to whole shares.
+- Total risk is the loss if every stop triggers at the stop price, not a worst case.
 """)
 
 
@@ -925,13 +1036,10 @@ with st.sidebar:
                              help="Groq retires models from time to time. Check console.groq.com/docs/models.")
     ai_top_k = st.slider("Analyse top N candidates", 3, 15, 6)
     key_input = st.text_input("Groq API key (or set GROQ_API_KEY)", type="password")
-    st.header("Risk & levels")
-    capital = st.number_input("Trading capital (₹)", 10000, 100000000, 500000, step=10000)
-    risk_pct = st.slider("Risk per trade (% of capital)", 0.25, 2.0, 0.75, 0.25)
+    st.header("Stop & target levels")
     atr_mult = st.slider("Stop = ATR multiple", 1.0, 3.0, 1.5, 0.25)
     rr = st.slider("Reward : Risk", 1.0, 4.0, 2.0, 0.5)
     max_sl_pct = st.slider("Max stop distance (%)", 2.0, 10.0, 6.0, 0.5)
-    max_alloc = st.slider("Max capital per stock (%)", 5, 50, 20, 5)
     st.divider()
     if st.button("Clear cached data"):
         st.cache_data.clear()
@@ -939,10 +1047,9 @@ with st.sidebar:
         st.session_state.pop("bt", None)
         st.success("Cache cleared. Run the screener again.")
 
-params = dict(min_turnover_cr=min_turnover, capital=capital, risk_pct=risk_pct,
-              atr_mult=atr_mult, rr=rr, max_sl_pct=max_sl_pct, max_alloc_pct=max_alloc)
+params = dict(min_turnover_cr=min_turnover, atr_mult=atr_mult, rr=rr, max_sl_pct=max_sl_pct)
 
-tab_scan, tab_bt = st.tabs(["🔎 Screener", "🧪 Backtest"])
+tab_scan, tab_ord, tab_bt = st.tabs(["🔎 Screener", "🧾 Orders", "🧪 Backtest"])
 
 with tab_scan:
     if st.button("Run screener", type="primary"):
@@ -960,6 +1067,13 @@ with tab_scan:
         render_scan(st.session_state["scan"])
     else:
         st.write("Set your parameters in the sidebar and press **Run screener**.")
+
+with tab_ord:
+    _scan = st.session_state.get("scan")
+    if not _scan or _scan.get("error") or _scan["picks"].empty:
+        st.info("Run the screener first. Orders are built from its candidates.")
+    else:
+        render_orders(_scan["picks"])
 
 with tab_bt:
     st.write("Replays the **technical** rules on past data using your sidebar stop/target settings. "
