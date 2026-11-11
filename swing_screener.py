@@ -8,6 +8,8 @@ Tab 1  Screener : technical score + multi-source news score (Moneycontrol, ET, B
                   headlines -> entry, stop-loss, target, position size.
 Tab 3  Orders   : turns the candidates into an order sheet for the capital you choose (quantities,
                   buy limit, stop, target, cash and risk limits). Nothing is sent to a broker.
+Intraday : a separate tab scans long AND short opening-range breakouts on 5-min data (VWAP + relative
+            volume), builds an intraday order sheet and backtests the rules on ~8 weeks of data.
 Tab 2  Backtest : replays the technical rules on 2-5 years of history, with next-day
                   open entries, stop/target simulation, costs, score buckets,
                   stability check and an optional stop/target sweep.
@@ -977,6 +979,468 @@ def render_orders(picks: pd.DataFrame):
 """)
 
 
+# --------------------------------------------------------------------- intraday data
+def _pick_ticker(raw, t, single):
+    if isinstance(raw.columns, pd.MultiIndex):
+        return raw[t] if t in raw.columns.get_level_values(0) else raw.xs(t, axis=1, level=1)
+    return raw if single else None
+
+
+def _intraday_index(d: pd.DataFrame) -> pd.DataFrame:
+    idx = pd.to_datetime(d.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+    d.index = idx
+    return d.between_time("09:15", "15:29")
+
+
+def _split_intraday(raw, symbols, tickers) -> dict:
+    out = {}
+    if raw is None or raw.empty:
+        return out
+    for s, t in zip(symbols, tickers):
+        try:
+            d = _pick_ticker(raw, t, len(tickers) == 1)
+            if d is None:
+                continue
+            d = d.dropna(subset=["Close"])[["Open", "High", "Low", "Close", "Volume"]].copy()
+            d = _intraday_index(d)
+            if len(d) >= 30:
+                out[s] = d
+        except Exception:
+            continue
+    return out
+
+
+def _download_intraday(tickers, days: int, threads: bool):
+    end = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+    start = end - pd.Timedelta(days=days)
+    return yf.download(tickers, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
+                       interval="5m", group_by="ticker", auto_adjust=True, threads=threads, progress=False)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _intraday_cached(symbols: tuple, days: int) -> dict:
+    out = {}
+    for k in range(0, len(symbols), 50):  # intraday payloads are big, so smaller batches
+        chunk = symbols[k:k + 50]
+        tickers = [x + ".NS" for x in chunk]
+        for threads in (True, False):
+            got = _split_intraday(_download_intraday(tickers, days, threads), chunk, tickers)
+            if got:
+                out.update(got)
+                break
+            time.sleep(1.5)
+    if not out:
+        raise RuntimeError("Yahoo Finance returned no intraday data")
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _nifty_intraday_cached(days: int) -> pd.DataFrame:
+    for threads in (True, False):
+        raw = _download_intraday(["^NSEI"], days, threads)
+        if raw is not None and not raw.empty:
+            d = _pick_ticker(raw, "^NSEI", True)
+            d = _intraday_index(d.dropna(subset=["Close"]).copy())
+            if len(d) >= 10:
+                return d
+        time.sleep(1.5)
+    raise RuntimeError("Yahoo Finance returned no intraday data for ^NSEI")
+
+
+def load_intraday(symbols, days: int):
+    try:
+        return _intraday_cached(tuple(symbols), int(days)), None
+    except Exception as ex:
+        return {}, f"{type(ex).__name__}: {str(ex)[:150]}"
+
+
+def load_nifty_intraday(days: int):
+    try:
+        return _nifty_intraday_cached(int(days)), None
+    except Exception as ex:
+        return pd.DataFrame(), f"{type(ex).__name__}: {str(ex)[:150]}"
+
+
+def prep_intraday(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds session VWAP, bar number, 5-min ATR and relative volume (cumulative volume so far today
+    versus the average of the previous 10 sessions at the same time of day)."""
+    d = df.copy()
+    d["Date"] = d.index.normalize()
+    d["BarNo"] = d.groupby("Date").cumcount()
+    d["CumVol"] = d.groupby("Date").Volume.cumsum()
+    tpv = (d.High + d.Low + d.Close) / 3 * d.Volume
+    d["VWAP"] = tpv.groupby(d.Date).cumsum() / d.CumVol.replace(0, np.nan)
+    pc = d.groupby("Date").Close.shift()
+    tr = pd.concat([d.High - d.Low, (d.High - pc).abs(), (d.Low - pc).abs()], axis=1).max(axis=1)
+    d["ATR5"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    piv = d.pivot_table(index="Date", columns="BarNo", values="CumVol", aggfunc="last")
+    base = piv.shift(1).rolling(10, min_periods=3).mean().stack()
+    key = pd.MultiIndex.from_arrays([d.Date, d.BarNo])
+    d["RVOL"] = d.CumVol.values / base.reindex(key).values
+    return d
+
+
+def nifty_bias(n5: pd.DataFrame, thr: float = 0.15):
+    """+1 bullish / -1 bearish / 0 neutral, from Nifty's move since the previous close."""
+    if n5 is None or n5.empty:
+        return 0, None
+    dates = n5.index.normalize()
+    prev = n5[dates < dates[-1]]
+    if prev.empty:
+        return 0, None
+    ret = (float(n5.Close.iloc[-1]) / float(prev.Close.iloc[-1]) - 1) * 100
+    return (1 if ret > thr else -1 if ret < -thr else 0), ret
+
+
+# ------------------------------------------------------------------ intraday signals
+def intraday_levels(side: int, entry: float, orh: float, orl: float, atr: float, o: dict):
+    """Stop = the tighter of the opposite side of the opening range and N x ATR, but never closer
+    than 1 x ATR (too tight just gets noise-stopped). Target = R:R x risk."""
+    if side == 1:
+        stop = min(entry - atr, max(orl, entry - o["stop_atr"] * atr))
+    else:
+        stop = max(entry + atr, min(orh, entry + o["stop_atr"] * atr))
+    stop = tick(stop)
+    risk = abs(entry - stop)
+    return stop, tick(entry + side * o["rr"] * risk), risk
+
+
+def live_signal(sym: str, d: pd.DataFrame, o: dict, bias: int):
+    day = d[d.Date == d.Date.iloc[-1]]
+    if len(day) < 4:
+        return None  # opening range (first 15 min) still forming
+    orh, orl = float(day.High.iloc[:3].max()), float(day.Low.iloc[:3].min())
+    last = day.iloc[-1]
+    close, vwap, atr = float(last.Close), float(last.VWAP), float(last.ATR5)
+    rvol = float(last.RVOL) if np.isfinite(last.RVOL) else np.nan
+    if not (np.isfinite(atr) and atr > 0 and np.isfinite(vwap)):
+        return None
+    prev = d[d.Date < day.Date.iloc[0]]
+    gap = (float(day.Open.iloc[0]) / float(prev.Close.iloc[-1]) - 1) * 100 if len(prev) else 0.0
+    post = day.iloc[3:]
+    near = o["near_atr"] * atr
+
+    side, status, trigger, since = 0, "", None, None
+    if close > orh and close > vwap:
+        side, trigger = 1, orh
+        since = int(last.BarNo - post.BarNo[post.Close > orh].iloc[0])
+    elif close < orl and close < vwap:
+        side, trigger = -1, orl
+        since = int(last.BarNo - post.BarNo[post.Close < orl].iloc[0])
+    elif close > vwap and 0 <= orh - close <= near:
+        side, trigger, status = 1, orh, "Near trigger"
+    elif close < vwap and 0 <= close - orl <= near:
+        side, trigger, status = -1, orl, "Near trigger"
+    if side == 0 or (side == 1 and not o["longs"]) or (side == -1 and not o["shorts"]):
+        return None
+    if o["align_nifty"] and ((side == 1 and bias < 0) or (side == -1 and bias > 0)):
+        return None
+    if status == "Near trigger":
+        if not (np.isfinite(rvol) and rvol >= 1.0):
+            return None
+        entry = tick(trigger + side * 0.05)
+        limit = tick(entry + side * 0.15 * atr)
+    else:
+        if not (np.isfinite(rvol) and rvol >= o["rvol_min"]):
+            return None
+        status = "Fresh breakout" if since <= o["fresh_bars"] else "Extended"
+        entry = tick(close)
+        limit = tick(entry + side * 0.25 * atr)
+    stop, target, risk = intraday_levels(side, entry, orh, orl, atr, o)
+    if risk <= 0 or abs(target - limit) <= 0 or (target - limit) * side <= 0:
+        return None
+    score = 10 * min(rvol, 4) + {"Fresh breakout": 25, "Near trigger": 15, "Extended": 5}[status]
+    score += 10 if (side == 1 and gap > 0.3) or (side == -1 and gap < -0.3) else 0
+    score += 10 if (side == 1 and bias > 0) or (side == -1 and bias < 0) else 0
+    chart = day[["Close", "VWAP"]].copy()
+    chart["OR high"], chart["OR low"] = orh, orl
+    return {
+        "Symbol": sym, "Side": "LONG" if side == 1 else "SHORT", "Status": status, "Rank": round(score, 1),
+        "Now": round(close, 2), "Trigger": round(trigger, 2), "Entry": entry, "Limit": limit, "Stop": stop,
+        "Target": target, "Risk%": round(risk / entry * 100, 2), "RVOL": round(rvol, 2), "Gap%": round(gap, 2),
+        "VWAP": round(vwap, 2), "BarsSince": since, "LastBar": last.name.strftime("%H:%M"), "_chart": chart,
+    }
+
+
+def run_intraday(cfg: dict) -> dict:
+    out = {"msgs": []}
+    syms = cfg["symbols"]
+    with st.spinner(f"Downloading 5-minute data for {len(syms)} stocks..."):
+        raw, err = load_intraday(syms, 12)
+        n5, nerr = load_nifty_intraday(12)
+    if not raw:
+        out["error"] = f"Could not download intraday data from Yahoo Finance. {err or ''} Try again in a minute."
+        return out
+    frames = {s: prep_intraday(d) for s, d in raw.items()}
+    last_ts = max(d.index[-1] for d in raw.values())
+    session = last_ts.normalize()
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    open_now = now.weekday() < 5 and pd.Timestamp("09:15").time() <= now.time() <= pd.Timestamp("15:30").time()
+    lag = (now.tz_localize(None) - (last_ts + pd.Timedelta(minutes=5))).total_seconds() / 60
+    if open_now and session.date() == now.date():
+        if lag > 20:
+            out["msgs"].append(("warning", f"Latest bar is {lag:.0f} minutes old. Yahoo's NSE data is delayed, "
+                                           "so check live prices on your broker before acting."))
+        else:
+            out["msgs"].append(("success", f"Live session. Last bar {last_ts.strftime('%H:%M')} IST."))
+    else:
+        out["msgs"].append(("info", f"Market is closed or not trading. Showing session {session.date()} as of "
+                                    f"{last_ts.strftime('%H:%M')} IST: use it to review, not to enter."))
+    bias, bret = nifty_bias(n5)
+    if bret is not None:
+        label = {1: "bullish", -1: "bearish", 0: "neutral"}[bias]
+        out["msgs"].append(("info", f"Nifty is {bret:+.2f}% versus the previous close: {label} bias."))
+    rows = []
+    for s, d in frames.items():
+        if d.index[-1] < last_ts - pd.Timedelta(minutes=15) or d.Date.iloc[-1] != session:
+            continue  # not trading today / stale
+        r = live_signal(s, d, cfg["o"], bias)
+        if r:
+            rows.append(r)
+    out.update(n_scanned=len(frames), session=str(session.date()), bias=bias)
+    if rows:
+        sig = pd.DataFrame(rows)
+        order = {"Fresh breakout": 0, "Near trigger": 1, "Extended": 2}
+        sig = sig.assign(_o=sig.Status.map(order)).sort_values(["_o", "Rank"], ascending=[True, False]).drop(columns="_o")
+        out["signals"] = sig.reset_index(drop=True)
+    else:
+        out["signals"] = pd.DataFrame()
+    return out
+
+
+# -------------------------------------------------------------- intraday order sheet
+def build_intraday_orders(sig: pd.DataFrame, o: dict):
+    orders, skipped = [], []
+    exposure_left = o["capital"] * o["leverage"]
+    risk_left = o["capital"] * o["risk_cap_pct"] / 100
+    for _, r in sig.iterrows():
+        sym, side = r.Symbol, (1 if r.Side == "LONG" else -1)
+        if len(orders) >= o["max_positions"]:
+            skipped.append((sym, "Max positions reached"))
+            continue
+        price, stop, target = float(r.Limit), float(r.Stop), float(r.Target)
+        rps = (price - stop) * side
+        if rps <= 0 or (target - price) * side <= 0:
+            skipped.append((sym, "Stop/target invalid at this limit price"))
+            continue
+        limits = {
+            "risk per trade": o["capital"] * o["risk_pct"] / 100 / rps,
+            "max % per stock": o["capital"] * o["leverage"] * o["max_alloc_pct"] / 100 / price,
+            "margin available": exposure_left / price,
+            "portfolio risk cap": risk_left / rps,
+        }
+        binding = min(limits, key=limits.get)
+        qty = math.floor(limits[binding])
+        if qty < 1:
+            skipped.append((sym, f"Cannot take 1 share of a ₹{price:,.0f} stock within '{binding}'"))
+            continue
+        value = qty * price
+        exposure_left -= value
+        risk_left -= qty * rps
+        near = r.Status == "Near trigger"
+        orders.append({
+            "Symbol": sym, "Side": "BUY" if side == 1 else "SELL (short)", "Qty": qty,
+            "Order": ("Stop-limit, trigger " + f"{r.Entry:.2f}") if near else "Limit (only if still near entry)",
+            "Limit": price, "Stop": round(stop, 2), "Target": round(target, 2), "Value ₹": round(value),
+            "Margin ₹": round(value / o["leverage"]), "Risk ₹": round(qty * rps),
+            "Reward ₹": round(qty * (target - price) * side), "R:R": round((target - price) * side / rps, 2),
+            "Limited by": binding, "Square off": "by 15:15",
+        })
+    df = pd.DataFrame(orders)
+    return df, skipped, {
+        "positions": len(df), "value": float(df["Value ₹"].sum()) if len(df) else 0.0,
+        "margin": float(df["Margin ₹"].sum()) if len(df) else 0.0,
+        "risk": float(df["Risk ₹"].sum()) if len(df) else 0.0,
+        "reward": float(df["Reward ₹"].sum()) if len(df) else 0.0}
+
+
+def render_intraday(out: dict):
+    if out.get("error"):
+        st.error(out["error"])
+        return
+    for level, text in out["msgs"]:
+        getattr(st, level)(text)
+    sig = out["signals"]
+    st.caption(f"Scanned {out['n_scanned']} stocks (session {out['session']}).")
+    if sig.empty:
+        st.warning("No stocks meet the entry rules right now. That is normal: most scans are empty most of the time.")
+        return
+    statuses = st.multiselect("Show / trade these setups", ["Fresh breakout", "Near trigger", "Extended"],
+                              default=["Fresh breakout", "Near trigger"], key="i_status")
+    sig = sig[sig.Status.isin(statuses)]
+    cols = ["Symbol", "Side", "Status", "Rank", "Now", "Trigger", "Entry", "Limit", "Stop", "Target", "Risk%",
+            "RVOL", "Gap%", "VWAP", "BarsSince", "LastBar"]
+    show_df(sig[cols], hide_index=True)
+    show_df_csv = sig[cols].to_csv(index=False).encode()
+    st.download_button("Download signals CSV", show_df_csv, "intraday_signals.csv", "text/csv")
+
+    with st.expander("Charts (top 4)"):
+        for _, r in sig.head(4).iterrows():
+            st.markdown(f"**{r.Symbol}** - {r.Side}, {r.Status}")
+            st.line_chart(r._chart)
+
+    st.subheader("Intraday order sheet")
+    c = st.columns(4)
+    cap = c[0].number_input("Capital (₹)", 10000, 1000000000, 500000, step=50000, key="i_cap")
+    lev = c[1].slider("Margin multiple (MIS leverage)", 1.0, 5.0, 1.0, 0.5, key="i_lev",
+                      help="1x = no leverage. Your broker sets the real MIS leverage per stock.")
+    risk = c[2].slider("Risk per trade (% of capital)", 0.1, 1.0, 0.25, 0.05, key="i_risk")
+    alloc = c[3].slider("Max per stock (% of buying power)", 5, 50, 20, 5, key="i_alloc")
+    d = st.columns(2)
+    maxpos = d[0].slider("Max positions", 1, 10, 3, key="i_maxpos")
+    rcap = d[1].slider("Total risk cap (% of capital)", 0.25, 3.0, 1.0, 0.25, key="i_rcap")
+    orders, skipped, sm = build_intraday_orders(sig, dict(
+        capital=cap, leverage=lev, risk_pct=risk, max_alloc_pct=alloc, max_positions=maxpos, risk_cap_pct=rcap))
+    if orders.empty:
+        st.warning("No orders fit these limits.")
+    else:
+        m = st.columns(4)
+        m[0].metric("Positions", sm["positions"])
+        m[1].metric("Margin needed", f"₹{sm['margin']:,.0f}")
+        m[2].metric("Loss if all stops hit", f"₹{sm['risk']:,.0f}", f"{sm['risk'] / cap * 100:.2f}% of capital", delta_color="off")
+        m[3].metric("Gain if all targets hit", f"₹{sm['reward']:,.0f}")
+        show_df(orders, hide_index=True)
+        st.download_button("Download intraday orders CSV", orders.to_csv(index=False).encode(),
+                           "intraday_orders.csv", "text/csv")
+    if skipped:
+        with st.expander(f"Skipped ({len(skipped)})"):
+            for sym, why in skipped:
+                st.write(f"**{sym}**: {why}")
+    st.markdown("""
+**Rules of the road**
+- **Shorting is intraday only** for ordinary cash-market trades: it must be bought back the same day (MIS product). Holding a short overnight needs futures.
+- Square off by about 15:15. Brokers auto-square-off around 15:15-15:25 and charge for it. Some stocks are not allowed for MIS or shorting; your broker's list decides.
+- *Fresh breakout* means the opening-range break happened recently on strong volume. The *Limit* price is the most you should pay (or the least you should accept when shorting); if the price has run past it, skip the trade.
+- *Near trigger* is a watch-list entry: place a stop-limit order at the trigger and cancel it if it hasn't fired by early afternoon.
+- Place the stop and target as soon as you are filled. Intraday costs (brokerage, STT, charges) and slippage matter a lot at these sizes.
+- Most retail intraday traders lose money. Size small, and check the backtest below first.
+""")
+
+
+# ------------------------------------------------------------------ intraday backtest
+def simulate_orb(frames: dict, o: dict) -> pd.DataFrame:
+    """Opening-range breakout on 5-min bars: signal on a bar's close beyond the opening range AND VWAP with
+    high relative volume, enter at the NEXT bar's open, one trade per stock per day, exit at stop / target /
+    15:15 square-off. If a bar touches both stop and target the stop is assumed first."""
+    trades = []
+    for sym, d in frames.items():
+        for date, day in d.groupby("Date"):
+            n = len(day)
+            if n < 30:
+                continue
+            O, H, L, C = (day[k].values for k in ("Open", "High", "Low", "Close"))
+            VW, RV, AT = day.VWAP.values, day.RVOL.values, day.ATR5.values
+            mins = (day.index.hour * 60 + day.index.minute).values
+            orh, orl = H[:3].max(), L[:3].min()
+            for j in range(3, n - 1):
+                if mins[j] > o["entry_cutoff_min"]:
+                    break
+                atr = AT[j]
+                if not np.isfinite(atr) or atr <= 0 or not np.isfinite(RV[j]) or RV[j] < o["rvol_min"]:
+                    continue
+                if o["longs"] and C[j] > orh and C[j] > VW[j]:
+                    side = 1
+                elif o["shorts"] and C[j] < orl and C[j] < VW[j]:
+                    side = -1
+                else:
+                    continue
+                entry = O[j + 1]
+                stop, target, risk = intraday_levels(side, entry, orh, orl, atr, o)
+                if risk <= 0:
+                    continue
+                exit_px, reason, k_exit = C[n - 1], "Data end", n - 1
+                for k in range(j + 1, n):
+                    if mins[k] >= o["squareoff_min"]:
+                        exit_px, reason, k_exit = O[k], "Square-off", k
+                        break
+                    hit_stop = L[k] <= stop if side == 1 else H[k] >= stop
+                    hit_tgt = H[k] >= target if side == 1 else L[k] <= target
+                    if hit_stop:
+                        exit_px, reason, k_exit = stop, "Stop", k
+                        break
+                    if hit_tgt:
+                        exit_px, reason, k_exit = target, "Target", k
+                        break
+                pnl = side * (exit_px - entry) - entry * o["cost_pct"] / 100
+                trades.append({
+                    "Symbol": sym, "Date": date, "Side": "LONG" if side == 1 else "SHORT",
+                    "EntryMin": int(mins[j + 1]), "Entry": round(entry, 2), "Stop": round(stop, 2),
+                    "Target": round(target, 2), "Exit": round(exit_px, 2), "Reason": reason,
+                    "Mins": int(mins[k_exit] - mins[j + 1]), "Ret%": round(pnl / entry * 100, 3),
+                    "R": round(pnl / risk, 3),
+                })
+                break  # one trade per stock per day
+    return pd.DataFrame(trades)
+
+
+def intraday_stats(t: pd.DataFrame) -> dict:
+    if t is None or t.empty:
+        return {"Trades": 0}
+    s = trade_stats(t.assign(Days=t.Mins, ExitDate=t.Date))
+    s["Avg mins"] = s.pop("Avg days")
+    return s
+
+
+def run_intraday_backtest(cfg: dict) -> dict:
+    out = {"cfg": cfg}
+    with st.spinner("Downloading ~8 weeks of 5-minute data (can take a minute)..."):
+        raw, err = load_intraday(cfg["symbols"], 55)
+    if not raw:
+        out["error"] = f"Could not download intraday history. {err or ''}"
+        return out
+    with st.spinner("Preparing data..."):
+        frames = {s: prep_intraday(d) for s, d in raw.items()}
+    t = simulate_orb(frames, cfg["o"])
+    out["n_stocks"] = len(frames)
+    out["n_days"] = len({d for f in frames.values() for d in f.Date.unique()})
+    out["trades"], out["stats"] = t, intraday_stats(t)
+    if t.empty:
+        return out
+    out["by_side"] = pd.DataFrame({k: intraday_stats(g) for k, g in t.groupby("Side")}).T
+    t["Window"] = pd.cut(t.EntryMin, bins=[0, 630, 720, 870, 2000],
+                         labels=["09:30-10:30", "10:30-12:00", "12:00-14:30", "after 14:30"], right=False).astype(str)
+    out["by_window"] = pd.DataFrame({k: intraday_stats(g) for k, g in t.groupby("Window")}).T
+    out["reasons"] = t.groupby("Reason").agg(Trades=("R", "size"), AvgR=("R", "mean")).round(3)
+    return out
+
+
+def render_intraday_backtest(out: dict):
+    if out.get("error"):
+        st.error(out["error"])
+        return
+    s = out["stats"]
+    if s.get("Trades", 0) == 0:
+        st.warning("No trades triggered. Loosen the volume filter or widen the stock list.")
+        return
+    st.caption(f"{out['n_stocks']} stocks over about {out['n_days']} sessions. "
+               f"Entries on next bar's open, square-off 15:15, costs {out['cfg']['o']['cost_pct']}% per round trip.")
+    m = st.columns(6)
+    for col, k in zip(m, ["Trades", "Win %", "Avg R", "Profit factor", "Max DD (R)", "Avg mins"]):
+        col.metric(k, s[k])
+    verdict = ("Positive after costs" if s["Avg R"] > 0.1 else "Marginal after costs" if s["Avg R"] > 0
+               else "Negative after costs")
+    st.info(f"**{verdict}** (average {s['Avg R']:+.2f} R per trade). With only ~8 weeks of data this is a "
+            "small, regime-specific sample: treat it as a sanity check, not proof.")
+    t = out["trades"].sort_values(["Date", "EntryMin"])
+    st.line_chart(pd.DataFrame({"Cumulative R": t.R.cumsum().values}, index=range(1, len(t) + 1)))
+    c1, c2 = st.columns(2)
+    c1.subheader("Long vs short")
+    c1.dataframe(out["by_side"])
+    c2.subheader("By entry time")
+    c2.dataframe(out["by_window"])
+    st.subheader("How trades ended")
+    st.dataframe(out["reasons"])
+    show = ["Symbol", "Date", "Side", "Entry", "Stop", "Target", "Exit", "Reason", "Mins", "Ret%", "R"]
+    show_df(t[show], hide_index=True)
+    st.download_button("Download intraday trades CSV", t[show].to_csv(index=False).encode(),
+                       "intraday_backtest_trades.csv", "text/csv")
+    st.warning("Limits: Yahoo keeps only about 60 days of 5-minute data; today's stock list is used (survivorship "
+               "bias); no Nifty filter, news or slippage beyond the cost setting; stop assumed first when a bar "
+               "touches both levels; real fills at the open of volatile bars can be worse.")
+
+
 # ---------------------------------------------------------------------------- UI
 st.set_page_config(page_title="Swing Screener (NSE)", layout="wide")
 st.title("📈 News + Momentum Swing Screener (NSE)")
@@ -1049,7 +1513,7 @@ with st.sidebar:
 
 params = dict(min_turnover_cr=min_turnover, atr_mult=atr_mult, rr=rr, max_sl_pct=max_sl_pct)
 
-tab_scan, tab_ord, tab_bt = st.tabs(["🔎 Screener", "🧾 Orders", "🧪 Backtest"])
+tab_scan, tab_ord, tab_intra, tab_bt = st.tabs(["🔎 Screener", "🧾 Orders", "⚡ Intraday (long/short)", "🧪 Backtest (swing)"])
 
 with tab_scan:
     if st.button("Run screener", type="primary"):
@@ -1074,6 +1538,50 @@ with tab_ord:
         st.info("Run the screener first. Orders are built from its candidates.")
     else:
         render_orders(_scan["picks"])
+
+with tab_intra:
+    st.write("Searches **long and short** intraday opportunities with an opening-range breakout (ORB) on 5-minute "
+             "data: price breaks the first 15-minute range, on the right side of VWAP, with unusual volume. "
+             "Run it during market hours (after about 9:45 IST).")
+    if not symbols:
+        st.info("Pick a stock list in the sidebar first.")
+    else:
+        with st.expander("Strategy settings", expanded=False):
+            a = st.columns(4)
+            i_topn = a[0].slider("Scan the first N stocks of your list", 10, 300, min(50, max(10, len(symbols))), key="i_topn")
+            i_rvol = a[1].slider("Min relative volume", 1.0, 4.0, 1.5, 0.25, key="i_rvol",
+                                 help="Volume so far today vs the average at this time of day.")
+            i_fresh = a[2].slider("'Fresh' = broke out within N bars", 1, 24, 6, key="i_fresh")
+            i_near = a[3].slider("'Near trigger' within (x ATR)", 0.1, 1.5, 0.5, 0.1, key="i_near")
+            b = st.columns(4)
+            i_stop = b[0].slider("Stop = ATR multiple (max)", 1.5, 6.0, 3.0, 0.5, key="i_stop")
+            i_rr = b[1].slider("Reward : Risk", 1.0, 3.0, 1.5, 0.25, key="i_rr")
+            i_dir = b[2].radio("Direction", ["Long & short", "Long only", "Short only"], key="i_dir")
+            i_align = b[3].checkbox("Align with Nifty direction", True, key="i_align",
+                                    help="No longs when Nifty is down >0.15% on the day, no shorts when up >0.15%.")
+        i_o = dict(rvol_min=i_rvol, fresh_bars=i_fresh, near_atr=i_near, stop_atr=i_stop, rr=i_rr,
+                   longs=i_dir != "Short only", shorts=i_dir != "Long only", align_nifty=i_align)
+        if st.button("Scan now", type="primary", key="i_scan"):
+            st.session_state["intra"] = run_intraday(dict(symbols=symbols[:i_topn], o=i_o))
+        if "intra" in st.session_state:
+            render_intraday(st.session_state["intra"])
+        else:
+            st.write("Press **Scan now**.")
+
+        st.divider()
+        st.subheader("Backtest this intraday strategy")
+        st.caption("Uses the settings above on roughly the last 8 weeks of 5-minute data (Yahoo's limit).")
+        e = st.columns(3)
+        i_cost = e[0].slider("Round-trip cost (%)", 0.0, 0.4, 0.10, 0.02, key="i_cost",
+                             help="Brokerage + STT + charges + slippage as % of trade value.")
+        i_cut = e[1].selectbox("No new entries after", ["13:30", "14:30"], index=1, key="i_cut")
+        if e[2].button("Run intraday backtest", key="i_bt"):
+            hh, mm = (int(x) for x in i_cut.split(":"))
+            st.session_state["intra_bt"] = run_intraday_backtest(dict(
+                symbols=symbols[:i_topn], o={**i_o, "cost_pct": i_cost, "entry_cutoff_min": hh * 60 + mm,
+                                              "squareoff_min": 15 * 60 + 15}))
+        if "intra_bt" in st.session_state:
+            render_intraday_backtest(st.session_state["intra_bt"])
 
 with tab_bt:
     st.write("Replays the **technical** rules on past data using your sidebar stop/target settings. "
