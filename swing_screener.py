@@ -10,6 +10,9 @@ Tab 3  Orders   : turns the candidates into an order sheet for the capital you c
                   buy limit, stop, target, cash and risk limits). Nothing is sent to a broker.
 Intraday : a separate tab scans long AND short opening-range breakouts on 5-min data (VWAP + relative
             volume), builds an intraday order sheet and backtests the rules on ~8 weeks of data.
+History  : every search is saved to a local SQLite file (swing_screener.db). Tick the orders you really
+           traded (editing quantity / price), track them in a Portfolio tab with stop / target / signal / news
+           alerts (in-app, Telegram, or the background monitor:  python swing_screener.py --monitor).
 Tab 2  Backtest : replays the technical rules on 2-5 years of history, with next-day
                   open entries, stop/target simulation, costs, score buckets,
                   stability check and an optional stop/target sweep.
@@ -23,13 +26,20 @@ Educational tool only - not investment advice. Data is delayed and can be wrong.
 Run the screener after 3:30 pm IST so the last daily candle is complete.
 """
 import calendar
+import hashlib
 import html
 import io
 import json
+import logging
 import math
 import os
+import pathlib
 import re
+import sqlite3
+import sys
+import tempfile
 import time
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote_plus
 
@@ -178,11 +188,23 @@ def fetch_yahoo(symbol: str) -> list:
     return out
 
 
+_KV_NAMES = None
+
+
 def _extra_names() -> dict:
+    global _KV_NAMES
     try:
-        return st.session_state.get("company_names", {})
+        names = st.session_state.get("company_names")
+        if names:
+            return names
     except Exception:
-        return {}
+        pass
+    if _KV_NAMES is None:
+        try:
+            _KV_NAMES = json.loads(kv_get("company_names", "{}") or "{}")
+        except Exception:
+            _KV_NAMES = {}
+    return _KV_NAMES
 
 
 def name_pattern(symbol: str):
@@ -818,6 +840,14 @@ def run_screener(cfg: dict) -> dict:
 
     out.update(res=res.drop(columns=["_df"]), picks=picks, news=news, ai=ai, dropped=dropped,
                news_top_n=cfg["news_top_n"], min_score=cfg["min_score"])
+    save = res.head(150).copy()
+    save["Picked"] = save.Symbol.isin(picks.Symbol)
+    save["AI"] = save.Symbol.map(dict(zip(picks.Symbol, picks.AI))).fillna("")
+    save["Side"] = "LONG"
+    sid, ids = save_scan("swing", cfg.get("universe", ""), {"min_score": cfg["min_score"], "levels": p,
+                         "news_top_n": cfg["news_top_n"], "drop_neg": cfg["drop_neg"], "use_ai": cfg["use_ai"]},
+                         len(prices), save)
+    out.update(scan_id=sid, signal_ids=ids)
     return out
 
 
@@ -829,6 +859,7 @@ def render_scan(out: dict):
         getattr(st, level)(text)
     for note in out["notes"]:
         st.caption(note)
+    st.caption(saved_label(out))
     if out["mood"] or out["feeds"]:
         with st.expander(f"Market headlines (last 24h) - tone: {out['mood']}  |  {len(out['mkt_rows'])} headlines"):
             render_headlines(out["mkt_rows"], 12)
@@ -931,7 +962,7 @@ def order_text(df: pd.DataFrame) -> str:
                      f" (limit {r['Stop limit']:.2f}) / TARGET {r.Target:.2f}" for _, r in df.iterrows())
 
 
-def render_orders(picks: pd.DataFrame):
+def render_orders(picks: pd.DataFrame, signal_ids=None):
     st.write("Builds an order sheet from the screener's candidates for the capital you choose. "
              "**Nothing is sent to a broker**; you place the orders yourself.")
     c = st.columns(4)
@@ -964,6 +995,7 @@ def render_orders(picks: pd.DataFrame):
         st.download_button("Download order sheet CSV", orders.to_csv(index=False).encode(), "order_sheet.csv", "text/csv")
         st.subheader("Copy-paste list")
         st.code(order_text(orders), language="text")
+        record_trades_ui(orders, "swing", signal_ids, "Buy limit", "Stop trigger", "swing")
     if skipped:
         with st.expander(f"Skipped ({len(skipped)})"):
             for sym, why in skipped:
@@ -1207,6 +1239,8 @@ def run_intraday(cfg: dict) -> dict:
         out["signals"] = sig.reset_index(drop=True)
     else:
         out["signals"] = pd.DataFrame()
+    sid, ids = save_scan("intraday", cfg.get("universe", f"{len(syms)} stocks"), cfg["o"], len(frames), out["signals"])
+    out.update(scan_id=sid, signal_ids=ids)
     return out
 
 
@@ -1263,7 +1297,7 @@ def render_intraday(out: dict):
     for level, text in out["msgs"]:
         getattr(st, level)(text)
     sig = out["signals"]
-    st.caption(f"Scanned {out['n_scanned']} stocks (session {out['session']}).")
+    st.caption(f"Scanned {out['n_scanned']} stocks (session {out['session']}). {saved_label(out)}")
     if sig.empty:
         st.warning("No stocks meet the entry rules right now. That is normal: most scans are empty most of the time.")
         return
@@ -1304,6 +1338,7 @@ def render_intraday(out: dict):
         show_df(orders, hide_index=True)
         st.download_button("Download intraday orders CSV", orders.to_csv(index=False).encode(),
                            "intraday_orders.csv", "text/csv")
+        record_trades_ui(orders, "intraday", out.get("signal_ids"), "Limit", "Stop", "intra")
     if skipped:
         with st.expander(f"Skipped ({len(skipped)})"):
             for sym, why in skipped:
@@ -1441,163 +1476,604 @@ def render_intraday_backtest(out: dict):
                "touches both levels; real fills at the open of volatile bars can be worse.")
 
 
-# ---------------------------------------------------------------------------- UI
-st.set_page_config(page_title="Swing Screener (NSE)", layout="wide")
-st.title("📈 News + Momentum Swing Screener (NSE)")
-st.caption("Educational tool, not investment advice. Run after market close for complete daily candles.")
+# ============================================================================ storage
+try:
+    _HERE = pathlib.Path(__file__).resolve().parent
+except NameError:
+    _HERE = pathlib.Path.cwd()
+DB_PATH = os.environ.get("SWING_DB") or str(_HERE / "swing_screener.db")
 
-with st.sidebar:
-    st.header("Universe")
-    mode = st.radio("Stocks to scan", ["Nifty 50 (fast)", "Market-cap filter", "My own symbols"])
-    symbols = tuple(NIFTY50)
-    if mode == "My own symbols":
-        raw_syms = st.text_area("NSE symbols (comma separated, no .NS)", ", ".join(NIFTY50), height=140)
-        symbols = tuple(dict.fromkeys(x.strip().upper() for x in raw_syms.replace("\n", ",").split(",") if x.strip()))
-    elif mode == "Market-cap filter":
-        src = st.selectbox("Start from", list(INDEX_SOURCES))
-        min_mcap = st.number_input("Minimum market cap (₹ crore)", 0, 2000000, 5000, step=500)
-        uploaded = st.file_uploader("Or upload a CSV with a Symbol column", type="csv",
-                                    help="Use this if the automatic download is blocked on your network.")
-        if st.button("Build / refresh universe"):
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS scans(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, kind TEXT, universe TEXT,
+    params TEXT, n_scanned INTEGER, n_signals INTEGER, summary TEXT);
+CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER, symbol TEXT, side TEXT,
+    score REAL, entry REAL, limit_price REAL, stop REAL, target REAL, payload TEXT);
+CREATE TABLE IF NOT EXISTS positions(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT, kind TEXT,
+    qty INTEGER, qty_initial INTEGER, entry_price REAL, stop REAL, stop_initial REAL, target REAL, status TEXT,
+    opened_at TEXT, closed_at TEXT, signal_id INTEGER, notes TEXT, last_price REAL, last_checked TEXT);
+CREATE TABLE IF NOT EXISTS exits(id INTEGER PRIMARY KEY AUTOINCREMENT, position_id INTEGER, ts TEXT, qty INTEGER,
+    price REAL, reason TEXT);
+CREATE TABLE IF NOT EXISTS edits(id INTEGER PRIMARY KEY AUTOINCREMENT, position_id INTEGER, ts TEXT, field TEXT,
+    old TEXT, new TEXT);
+CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY AUTOINCREMENT, position_id INTEGER, ts TEXT, type TEXT,
+    severity TEXT, message TEXT, price REAL, ref TEXT, acked INTEGER DEFAULT 0, sent INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
+"""
+
+
+def now_ist() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None)
+
+
+def is_market_open(now=None) -> bool:
+    now = now if now is not None else now_ist()
+    return now.weekday() < 5 and 9 * 60 + 15 <= now.hour * 60 + now.minute <= 15 * 60 + 30
+
+
+def _con():
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("PRAGMA journal_mode=WAL")  # lets the app and the background monitor share the file
+    except Exception:
+        pass
+    con.executescript(SCHEMA)
+    return con
+
+
+def db_all(sql: str, args=()) -> list:
+    with closing(_con()) as con:
+        return [dict(r) for r in con.execute(sql, args).fetchall()]
+
+
+def db_run(sql: str, args=()):
+    with closing(_con()) as con:
+        cur = con.execute(sql, args)
+        con.commit()
+        return cur.lastrowid
+
+
+def kv_get(k: str, default=None):
+    rows = db_all("SELECT v FROM kv WHERE k=?", (k,))
+    return rows[0]["v"] if rows else default
+
+
+def kv_set(k: str, v: str):
+    db_run("INSERT OR REPLACE INTO kv(k, v) VALUES (?, ?)", (k, v))
+
+
+def _jdefault(o):
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return None if np.isnan(o) else float(o)
+    return str(o)
+
+
+def _f(x):
+    try:
+        x = float(x)
+        return None if np.isnan(x) else x
+    except (TypeError, ValueError):
+        return None
+
+
+def save_scan(kind: str, universe: str, params: dict, n_scanned: int, df=None, summary=None):
+    """Stores a search and its signals. Returns (scan_id, {symbol: signal_id}); never raises."""
+    try:
+        sid = db_run("INSERT INTO scans(ts,kind,universe,params,n_scanned,n_signals,summary) VALUES (?,?,?,?,?,?,?)",
+                     (str(now_ist()), kind, universe, json.dumps(params, default=_jdefault), int(n_scanned),
+                      0 if df is None else int(len(df)), json.dumps(summary, default=_jdefault) if summary else None))
+        ids = {}
+        if df is not None and len(df):
+            clean = df[[c for c in df.columns if not str(c).startswith("_")]]
+            clean = clean.astype(object).where(pd.notna(clean), None)
+            with closing(_con()) as con:
+                for r in clean.to_dict("records"):
+                    cur = con.execute(
+                        "INSERT INTO signals(scan_id,symbol,side,score,entry,limit_price,stop,target,payload) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (sid, r.get("Symbol"), r.get("Side") or "LONG", _f(r.get("Score", r.get("Rank"))),
+                         _f(r.get("Entry")), _f(r.get("Limit", r.get("MaxChase"))), _f(r.get("Stop")),
+                         _f(r.get("Target")), json.dumps(r, default=_jdefault)))
+                    ids[r.get("Symbol")] = cur.lastrowid
+                con.commit()
+        return sid, ids
+    except Exception:
+        return None, {}
+
+
+# ---------------------------------------------------------------------------- positions
+def validate_levels(side: str, entry, stop, target):
+    s = 1 if side == "LONG" else -1
+    if not entry or entry <= 0:
+        return "Entry price must be positive."
+    if not stop or (entry - stop) * s <= 0:
+        return f"Stop must be {'below' if s == 1 else 'above'} the entry price for a {side} trade."
+    if target and (target - entry) * s <= 0:
+        return f"Target must be {'above' if s == 1 else 'below'} the entry price for a {side} trade."
+    return None
+
+
+def add_position(symbol, side, kind, qty, price, stop, target, signal_id=None, notes="", opened_at=None) -> int:
+    err = validate_levels(side, price, stop, target)
+    if err:
+        raise ValueError(f"{symbol}: {err}")
+    if int(qty) < 1:
+        raise ValueError(f"{symbol}: quantity must be at least 1.")
+    return db_run(
+        "INSERT INTO positions(symbol,side,kind,qty,qty_initial,entry_price,stop,stop_initial,target,status,"
+        "opened_at,signal_id,notes) VALUES (?,?,?,?,?,?,?,?,?,'OPEN',?,?,?)",
+        (symbol.strip().upper(), side, kind, int(qty), int(qty), float(price), float(stop), float(stop),
+         float(target or 0), str(opened_at or now_ist()), signal_id, notes or ""))
+
+
+def update_position(pid: int, changes: dict):
+    """Edit qty / entry / stop / target / notes of an open position, keeping an audit trail."""
+    rows = db_all("SELECT * FROM positions WHERE id=?", (pid,))
+    if not rows:
+        raise ValueError("Position not found")
+    p = rows[0]
+    new = {**p, **changes}
+    if "qty" in changes and int(new["qty"]) < 1:
+        raise ValueError(f"{p['symbol']}: quantity must be at least 1 (use 'Record exit' to close).")
+    err = validate_levels(p["side"], new["entry_price"], new["stop"], new["target"])
+    if err:
+        raise ValueError(f"{p['symbol']}: {err}")
+    for field, val in changes.items():
+        if str(p[field]) != str(val):
+            db_run("INSERT INTO edits(position_id,ts,field,old,new) VALUES (?,?,?,?,?)",
+                   (pid, str(now_ist()), field, str(p[field]), str(val)))
+            db_run(f"UPDATE positions SET {field}=? WHERE id=?", (val, pid))
+            if field == "qty":  # keep the original size in step when the entry is being corrected
+                db_run("UPDATE positions SET qty_initial=? WHERE id=?", (int(val), pid))
+
+
+def record_exit(pid: int, qty: int, price: float, reason: str):
+    rows = db_all("SELECT * FROM positions WHERE id=? AND status='OPEN'", (pid,))
+    if not rows:
+        raise ValueError("Position is not open")
+    p = rows[0]
+    qty = int(qty) or p["qty"]
+    if qty < 1 or qty > p["qty"]:
+        raise ValueError(f"Exit quantity must be between 1 and {p['qty']}")
+    if not price or price <= 0:
+        raise ValueError("Exit price must be positive")
+    db_run("INSERT INTO exits(position_id,ts,qty,price,reason) VALUES (?,?,?,?,?)",
+           (pid, str(now_ist()), qty, float(price), reason))
+    left = p["qty"] - qty
+    if left == 0:
+        db_run("UPDATE positions SET qty=0, status='CLOSED', closed_at=? WHERE id=?", (str(now_ist()), pid))
+    else:
+        db_run("UPDATE positions SET qty=? WHERE id=?", (left, pid))
+
+
+def position_pnl(p: dict, price):
+    """(unrealised P&L in rupees, % move, R multiple) of what is still open."""
+    if not price:
+        return None, None, None
+    s = 1 if p["side"] == "LONG" else -1
+    move = (price - p["entry_price"]) * s
+    risk = abs(p["entry_price"] - p["stop_initial"])
+    return round(move * p["qty"], 2), round(move / p["entry_price"] * 100, 2), (round(move / risk, 2) if risk else None)
+
+
+def realised_pnl() -> float:
+    rows = db_all("SELECT p.side, p.entry_price, e.qty, e.price FROM exits e JOIN positions p ON p.id=e.position_id")
+    return float(sum((r["price"] - r["entry_price"]) * r["qty"] * (1 if r["side"] == "LONG" else -1) for r in rows))
+
+
+# ------------------------------------------------------------------------------ alerts
+ALERT_ICON = {"STOP": "🛑", "TARGET": "🎯", "BREAKEVEN": "🔒", "NEWS": "📰", "TREND": "📉", "RSI": "🌡️",
+              "TIME": "⏳", "VWAP": "〰️", "OR_BREAK": "↩️", "SQUAREOFF_NOW": "⏰", "SQUAREOFF_SOON": "⏰",
+              "STALE_INTRADAY": "⚠️"}
+MON_DEFAULTS = {"news": True, "trend_break": True, "rsi": True, "vwap": True, "max_hold_days": 10}
+
+
+def mon_opts() -> dict:
+    try:
+        return {**MON_DEFAULTS, **json.loads(kv_get("mon_opts", "{}") or "{}")}
+    except Exception:
+        return dict(MON_DEFAULTS)
+
+
+def add_alert(pid, type_, severity, message, price, ref):
+    """Inserts an alert unless the same (position, type, ref) was already raised. Returns id or None."""
+    if db_all("SELECT id FROM alerts WHERE position_id=? AND type=? AND ref=?", (pid, type_, str(ref))):
+        return None
+    return db_run("INSERT INTO alerts(position_id,ts,type,severity,message,price,ref) VALUES (?,?,?,?,?,?,?)",
+                  (pid, str(now_ist()), type_, severity, message, _f(price), str(ref)))
+
+
+def tg_creds():
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN") or kv_get("tg_token") or ""
+    chat = os.environ.get("TELEGRAM_CHAT_ID") or kv_get("tg_chat") or ""
+    if not tok:
+        try:
+            tok, chat = st.secrets.get("TELEGRAM_BOT_TOKEN", ""), st.secrets.get("TELEGRAM_CHAT_ID", chat)
+        except Exception:
+            pass
+    return tok, chat
+
+
+def send_telegram(text: str):
+    tok, chat = tg_creds()
+    if not (tok and chat):
+        return False, "Telegram is not configured"
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                          json={"chat_id": chat, "text": text[:3900]}, timeout=10)
+        return r.status_code == 200, r.text[:120]
+    except Exception as ex:
+        return False, f"{type(ex).__name__}: {str(ex)[:100]}"
+
+
+def _first_idx(mask):
+    idx = np.flatnonzero(mask)
+    return int(idx[0]) if len(idx) else None
+
+
+def evaluate_position(p: dict, bars5, daily, now: pd.Timestamp, opts: dict, news=None):
+    """Applies the exit rules to one open position. Returns (alerts, latest_price)."""
+    s = 1 if p["side"] == "LONG" else -1
+    sym, entry, stop, target = p["symbol"], p["entry_price"], p["stop"], (p["target"] or 0.0)
+    opened = pd.Timestamp(p["opened_at"])
+    alerts = []
+
+    def add(type_, sev, msg, price, ref):
+        alerts.append(dict(type=type_, severity=sev, message=f"{sym} ({p['side']}): {msg}", price=price, ref=str(ref)))
+
+    price, since = None, None
+    if bars5 is not None and len(bars5):
+        price = float(bars5.Close.iloc[-1])
+        since = bars5[bars5.index > opened.floor("5min")]  # bars after the one in which the trade was taken
+    elif daily is not None and len(daily):
+        price = float(daily.Close.iloc[-1])
+    if price is None:
+        return alerts, None
+
+    # 1) stop / target (whichever was touched first wins; the stop wins a tie)
+    si = ti = None
+    if since is not None and len(since):
+        H, L = since.High.values, since.Low.values
+        si = _first_idx((L <= stop) if s == 1 else (H >= stop))
+        ti = _first_idx((H >= target) if s == 1 else (L <= target)) if target else None
+    BIG = 10 ** 9
+    if si is None and (price - stop) * s <= 0:
+        si = BIG
+    if ti is None and target and (price - target) * s >= 0:
+        ti = BIG
+    if si is not None and (ti is None or si <= ti):
+        add("STOP", "critical", f"STOP HIT at {stop:.2f} (last {price:.2f}). Exit now.", stop, f"{stop:.2f}")
+        return alerts, price
+    if ti is not None:
+        add("TARGET", "high", f"TARGET reached at {target:.2f} (last {price:.2f}). Book profit or trail the stop.",
+            target, f"{target:.2f}")
+        return alerts, price
+
+    # 2) breakeven nudge once the trade is a full R in profit
+    risk = abs(entry - p["stop_initial"])
+    if since is not None and len(since) and risk > 0:
+        fav = (since.High.max() - entry) if s == 1 else (entry - since.Low.min())
+        if fav >= risk and (stop - entry) * s < 0:
+            add("BREAKEVEN", "info", f"up {fav / risk:.1f}R at best: consider moving the stop to breakeven ({entry:.2f}).",
+                price, "BE")
+
+    # 3) swing rules on the last COMPLETED daily bar
+    if p["kind"] == "swing" and daily is not None and len(daily) >= 30:
+        d = add_indicators(daily.copy())
+        use_prev = is_market_open(now) and d.index[-1].date() == now.date() and len(d) > 2
+        row = d.iloc[-2] if use_prev else d.iloc[-1]
+        bar_date = row.name.date()
+        if bar_date > opened.date():
+            if opts["trend_break"] and ((s == 1 and row.Close < row.EMA20) or (s == -1 and row.Close > row.EMA20)):
+                add("TREND", "warning", f"closed {'below' if s == 1 else 'above'} its 20-day EMA ({row.EMA20:.2f}): "
+                    "trend break. Consider exiting.", price, bar_date)
+            if opts["rsi"] and ((s == 1 and row.RSI > 78) or (s == -1 and row.RSI < 22)):
+                add("RSI", "info", f"RSI {row.RSI:.0f} is stretched. Consider booking part.", price, bar_date)
+        held = int(np.busday_count(opened.date(), now.date()))
+        r_now = (price - entry) * s / risk if risk else 0
+        if held > opts["max_hold_days"] and r_now < 0.5:
+            add("TIME", "warning", f"held {held} sessions with only {r_now:+.1f}R. Time-stop: consider exiting.",
+                price, now.date())
+
+    # 4) intraday rules
+    if p["kind"] == "intraday":
+        if opened.date() < now.date():
+            add("STALE_INTRADAY", "critical", "intraday position is still open from a previous day. Close it "
+                "(brokers auto-square-off).", price, now.date())
+        elif bars5 is not None and len(bars5):
+            d5 = prep_intraday(bars5)
+            day = d5[d5.Date == d5.Date.iloc[-1]]
+            last = day.iloc[-1]
+            if opts["vwap"] and np.isfinite(last.VWAP) and (price - last.VWAP) * s < 0 and since is not None and len(since) >= 2:
+                add("VWAP", "warning", f"price is back through VWAP ({last.VWAP:.2f}); momentum fading.",
+                    price, f"{now.date()}-{last.name.hour}")
+            if len(day) >= 4:
+                orh, orl = day.High.iloc[:3].max(), day.Low.iloc[:3].min()
+                if (s == 1 and price < orl) or (s == -1 and price > orh):
+                    add("OR_BREAK", "high", "price broke the opposite side of the opening range.", price, now.date())
+            mins = now.hour * 60 + now.minute
+            if mins >= 15 * 60 + 10:
+                add("SQUAREOFF_NOW", "critical", "square off now (after 15:10).", price, now.date())
+            elif mins >= 15 * 60:
+                add("SQUAREOFF_SOON", "warning", "square off by 15:15.", price, now.date())
+
+    # 5) adverse news (bad for a long, good news for a short)
+    if news and opts["news"] and news["rows"]:
+        pts = news["points"]
+        if s * pts <= -3 or (s == 1 and news["flags"]):
+            worst = min(news["rows"], key=lambda r: s * r["s"])
+            add("NEWS", "warning", f"adverse news: {worst['title'][:110]} ({worst['source']}, "
+                f"{age_label(worst['age_h'])}).", price, hashlib.md5(worst["title"].encode()).hexdigest()[:10])
+    return alerts, price
+
+
+def read_general_feeds(feeds_text: str):
+    items = []
+    for line in feeds_text.splitlines():
+        if "|" in line:
+            name, url = [x.strip() for x in line.split("|", 1)]
+            items += fetch_feed(url, name)[0]
+    return items
+
+
+def monitor_once(opts=None, send: bool = True, fresh: bool = True, news_every_min: int = 20) -> dict:
+    """One pass over every open position: refresh prices, apply the rules, store and push new alerts."""
+    opts = opts or mon_opts()
+    pos = db_all("SELECT * FROM positions WHERE status='OPEN'")
+    res = {"checked": len(pos), "new": [], "errors": []}
+    if not pos:
+        return res
+    now = now_ist()
+    syms = sorted({p["symbol"] for p in pos})
+    oldest = min(pd.Timestamp(p["opened_at"]) for p in pos)
+    days = int(min(55, max(5, (now - oldest).days + 3)))
+    if fresh:  # the loaders cache for minutes; an alert check must see the newest bars
+        _intraday_cached.clear()
+        _prices_cached.clear()
+    bars, berr = load_intraday(syms, days)
+    daily, derr = load_prices(tuple(syms), 150)
+    if berr and derr:
+        res["errors"].append(f"No price data: {berr}")
+    last_news = pd.Timestamp(kv_get("last_news_check", "2000-01-01"))
+    do_news = bool(opts["news"]) and (now - last_news).total_seconds() / 60 >= news_every_min
+    general = read_general_feeds(DEFAULT_FEEDS) if do_news else []
+    for p in pos:
+        news = collect_news(p["symbol"], general, dict(use_general=True, use_google=True, use_yahoo=True,
+                                                        max_age_h=24)) if do_news else None
+        alerts, price = evaluate_position(p, bars.get(p["symbol"]), daily.get(p["symbol"]), now, opts, news)
+        if price is not None:
+            db_run("UPDATE positions SET last_price=?, last_checked=? WHERE id=?", (price, str(now), p["id"]))
+        for a in alerts:
+            aid = add_alert(p["id"], a["type"], a["severity"], a["message"], a["price"], a["ref"])
+            if aid:
+                res["new"].append({**a, "id": aid, "position_id": p["id"]})
+    if do_news:
+        kv_set("last_news_check", str(now))
+    if send:
+        for a in res["new"]:
+            ok, _ = send_telegram(f"{ALERT_ICON.get(a['type'], '⚠️')} {a['message']}")
+            if ok:
+                db_run("UPDATE alerts SET sent=1 WHERE id=?", (a["id"],))
+    return res
+
+
+def monitor_loop(interval: int = 120, once: bool = False):
+    """Headless mode:  python swing_screener.py --monitor   (keep it running, or use Task Scheduler)."""
+    print(f"Monitoring open positions in {DB_PATH} every {interval}s during market hours (Ctrl+C to stop).")
+    last_eod = None
+    while True:
+        now = now_ist()
+        eod = now.weekday() < 5 and now.hour == 16 and now.minute < 10 and last_eod != now.date()
+        if is_market_open(now) or eod or once:
             try:
-                base = parse_universe_csv(uploaded.getvalue()) if uploaded else fetch_universe_list(INDEX_SOURCES[src])
+                res = monitor_once()
+                print(f"[{now:%d-%b %H:%M:%S}] checked {res['checked']} position(s), {len(res['new'])} new alert(s)")
+                for a in res["new"]:
+                    print("   ", ALERT_ICON.get(a["type"], "!"), a["message"])
+                for e in res["errors"]:
+                    print("    note:", e)
             except Exception as ex:
-                st.error(f"Could not load the stock list ({type(ex).__name__}: {str(ex)[:100]}). "
-                         "Download the CSV from niftyindices.com or nseindia.com and upload it above.")
-            else:
-                bar = st.progress(0.0, text=f"Fetching market caps for {len(base)} stocks "
-                                            "(first run takes a few minutes, then cached for 24h)...")
-                uni = build_universe(base, lambda f: bar.progress(f))
-                bar.empty()
-                st.session_state["universe"] = uni
-                st.session_state["company_names"] = dict(zip(uni.Symbol, uni.Name))
-        uni = st.session_state.get("universe")
-        if uni is None:
-            symbols = ()
-            st.info("Press **Build / refresh universe** first.")
+                print(f"[{now:%H:%M:%S}] monitor error: {type(ex).__name__}: {ex}")
+            if eod:
+                last_eod = now.date()
+        if once:
+            break
+        time.sleep(interval)
+
+
+# ------------------------------------------------------- forward test of saved signals
+def eval_swing_signal(sig: dict, daily: pd.DataFrame, scan_ts, max_hold: int = 10) -> dict:
+    """Enter at the next session's open (unless it gaps past max-chase), then stop / target / time."""
+    bars = daily[daily.index > pd.Timestamp(scan_ts).normalize()]
+    stop, target, chase = sig.get("Stop"), sig.get("Target"), sig.get("MaxChase")
+    if bars.empty:
+        return {"Outcome": "Pending"}
+    entry = float(bars.Open.iloc[0])
+    if chase and entry > chase:
+        return {"Outcome": "No fill (gapped up)"}
+    risk = entry - stop
+    if risk <= 0 or entry >= target:
+        return {"Outcome": "Invalid levels"}
+    n, exit_px, why, k = len(bars), None, None, 0
+    for k in range(min(max_hold, n)):
+        o, h, l = (float(bars[x].iloc[k]) for x in ("Open", "High", "Low"))
+        if k > 0 and o <= stop:
+            exit_px, why = o, "Stop (gap)"
+        elif k > 0 and o >= target:
+            exit_px, why = o, "Target (gap)"
+        elif l <= stop:
+            exit_px, why = stop, "Stop"
+        elif h >= target:
+            exit_px, why = target, "Target"
+        if why:
+            break
+    if why is None:
+        if n >= max_hold:
+            exit_px, why, k = float(bars.Close.iloc[max_hold - 1]), "Time", max_hold - 1
         else:
-            sel = uni[uni.MCapCr >= min_mcap].sort_values("MCapCr", ascending=False)
-            symbols = tuple(sel.Symbol)
-            st.caption(f"{len(sel)} of {len(uni)} stocks have market cap ≥ ₹{min_mcap:,.0f} cr "
-                       f"({int(uni.MCapCr.isna().sum())} had no market-cap data and are excluded).")
-            st.download_button("Download universe CSV", sel.to_csv(index=False).encode(), "universe.csv", "text/csv")
-    if len(symbols) > 300:
-        st.warning(f"{len(symbols)} stocks: first runs download a lot of data and can take several minutes.")
-    st.header("Filters")
-    min_score = st.slider("Minimum score (screener)", 0, 100, 55)
-    min_turnover = st.number_input("Min avg daily turnover (₹ crore)", 0.0, 1000.0, 20.0)
-    st.header("News")
-    use_general = st.checkbox("Market RSS feeds (Moneycontrol, ET, BS, Mint)", True)
-    use_google = st.checkbox("Google News search per stock", True)
-    use_yahoo = st.checkbox("Yahoo Finance news", True)
-    feeds_text = st.text_area("RSS feeds (Name | URL per line)", DEFAULT_FEEDS, height=150)
-    max_age_h = st.slider("Ignore headlines older than (hours)", 24, 168, 72, 24)
-    news_top_n = st.slider("Check news for top N technical candidates", 5, 30, 15)
-    drop_neg = st.checkbox("Drop negative news / red flags / AI 'avoid'", True)
-    st.header("AI headline read (Groq, optional)")
-    use_ai = st.checkbox("Analyse headlines with Groq", False)
-    ai_model = st.text_input("Groq model ID", "openai/gpt-oss-120b",
-                             help="Groq retires models from time to time. Check console.groq.com/docs/models.")
-    ai_top_k = st.slider("Analyse top N candidates", 3, 15, 6)
-    key_input = st.text_input("Groq API key (or set GROQ_API_KEY)", type="password")
-    st.header("Stop & target levels")
-    atr_mult = st.slider("Stop = ATR multiple", 1.0, 3.0, 1.5, 0.25)
-    rr = st.slider("Reward : Risk", 1.0, 4.0, 2.0, 0.5)
-    max_sl_pct = st.slider("Max stop distance (%)", 2.0, 10.0, 6.0, 0.5)
-    st.divider()
-    if st.button("Clear cached data"):
-        st.cache_data.clear()
-        st.session_state.pop("scan", None)
-        st.session_state.pop("bt", None)
-        st.success("Cache cleared. Run the screener again.")
+            exit_px, why, k = float(bars.Close.iloc[-1]), "Open", n - 1
+    return {"Outcome": why, "Entry": round(entry, 2), "Exit": round(exit_px, 2), "R": round((exit_px - entry) / risk, 2),
+            "Ret%": round((exit_px / entry - 1) * 100, 2), "Bars": k + 1}
 
-params = dict(min_turnover_cr=min_turnover, atr_mult=atr_mult, rr=rr, max_sl_pct=max_sl_pct)
 
-tab_scan, tab_ord, tab_intra, tab_bt = st.tabs(["🔎 Screener", "🧾 Orders", "⚡ Intraday (long/short)", "🧪 Backtest (swing)"])
-
-with tab_scan:
-    if st.button("Run screener", type="primary"):
-        if not symbols:
-            st.warning("No stocks selected. Build the universe (or pick another option) in the sidebar.")
-        else:
-            st.session_state["scan"] = run_screener(dict(
-                symbols=symbols, params=params, min_score=min_score, use_general=use_general,
-                use_google=use_google, use_yahoo=use_yahoo, feeds_text=feeds_text,
-                news_opt=dict(use_general=use_general, use_google=use_google, use_yahoo=use_yahoo,
-                              max_age_h=max_age_h),
-                news_top_n=news_top_n, drop_neg=drop_neg, use_ai=use_ai, ai_model=ai_model.strip(),
-                ai_top_k=ai_top_k, groq_key=(key_input.strip() or groq_key())))
-    if "scan" in st.session_state:
-        render_scan(st.session_state["scan"])
+def eval_intraday_signal(sig: dict, bars5: pd.DataFrame, scan_ts) -> dict:
+    side = 1 if sig["Side"] == "LONG" else -1
+    scan_ts = pd.Timestamp(scan_ts)
+    b = bars5[(bars5.index.normalize() == scan_ts.normalize()) & (bars5.index > scan_ts.floor("5min"))]
+    if b.empty:
+        return {"Outcome": "Pending"}
+    entry, stop, target = sig["Entry"], sig["Stop"], sig["Target"]
+    O, H, L = b.Open.values, b.High.values, b.Low.values
+    mins = (b.index.hour * 60 + b.index.minute).values
+    if sig.get("Status") == "Near trigger":
+        hit = np.flatnonzero(H >= entry) if side == 1 else np.flatnonzero(L <= entry)
+        if not len(hit):
+            return {"Outcome": "No fill (not triggered)"}
+        k0 = int(hit[0])
+        fill = max(O[k0], entry) if side == 1 else min(O[k0], entry)
+        first = k0 + 1
     else:
-        st.write("Set your parameters in the sidebar and press **Run screener**.")
+        lim = sig["Limit"]
+        if (side == 1 and O[0] > lim) or (side == -1 and O[0] < lim):
+            return {"Outcome": "No fill (ran past limit)"}
+        fill, first = O[0], 0
+    risk = (fill - stop) * side
+    if risk <= 0 or (target - fill) * side <= 0:
+        return {"Outcome": "Invalid levels"}
+    exit_px, why = None, None
+    for k in range(first, len(b)):
+        if mins[k] >= 15 * 60 + 15:
+            exit_px, why = O[k], "Square-off"
+        elif (L[k] <= stop if side == 1 else H[k] >= stop):
+            exit_px, why = stop, "Stop"
+        elif (H[k] >= target if side == 1 else L[k] <= target):
+            exit_px, why = target, "Target"
+        if why:
+            break
+    if why is None:
+        exit_px, why = float(b.Close.iloc[-1]), ("Open" if mins[-1] < 15 * 60 + 15 and b.index[-1].date() == now_ist().date() else "Data end")
+    return {"Outcome": why, "Entry": round(float(fill), 2), "Exit": round(float(exit_px), 2),
+            "R": round(side * (exit_px - fill) / risk, 2), "Ret%": round(side * (exit_px / fill - 1) * 100, 2)}
 
-with tab_ord:
-    _scan = st.session_state.get("scan")
-    if not _scan or _scan.get("error") or _scan["picks"].empty:
-        st.info("Run the screener first. Orders are built from its candidates.")
+
+def evaluate_scan(scan: dict, sigs: list, only_picked: bool = True):
+    """Replays a saved scan's signals against what the market did afterwards. Returns (DataFrame, error)."""
+    rows = []
+    for r in sigs:
+        pl = json.loads(r["payload"])
+        if scan["kind"] == "swing" and only_picked and not pl.get("Picked", True):
+            continue
+        rows.append({**pl, "signal_id": r["id"]})
+    if not rows:
+        return pd.DataFrame(), "No signals to evaluate."
+    syms = tuple(sorted({r["Symbol"] for r in rows}))
+    age = (now_ist() - pd.Timestamp(scan["ts"])).days
+    out = []
+    if scan["kind"] == "swing":
+        daily, err = load_prices(syms, age + 40)
+        if not daily:
+            return pd.DataFrame(), f"Could not load prices. {err or ''}"
+        for r in rows:
+            d = daily.get(r["Symbol"])
+            out.append({"Symbol": r["Symbol"], **(eval_swing_signal(r, d, scan["ts"]) if d is not None else {"Outcome": "No data"})})
     else:
-        render_orders(_scan["picks"])
+        if age > 55:
+            return pd.DataFrame(), "Yahoo keeps only ~60 days of 5-minute data, so this scan is too old to evaluate."
+        raw, err = load_intraday(syms, min(55, age + 3))
+        if not raw:
+            return pd.DataFrame(), f"Could not load intraday prices. {err or ''}"
+        for r in rows:
+            d = raw.get(r["Symbol"])
+            out.append({"Symbol": r["Symbol"], "Side": r["Side"], "Status": r.get("Status"),
+                        **(eval_intraday_signal(r, d, scan["ts"]) if d is not None else {"Outcome": "No data"})})
+    return pd.DataFrame(out), None
 
-with tab_intra:
-    st.write("Searches **long and short** intraday opportunities with an opening-range breakout (ORB) on 5-minute "
-             "data: price breaks the first 15-minute range, on the right side of VWAP, with unusual volume. "
-             "Run it during market hours (after about 9:45 IST).")
-    if not symbols:
-        st.info("Pick a stock list in the sidebar first.")
-    else:
-        with st.expander("Strategy settings", expanded=False):
-            a = st.columns(4)
-            i_topn = a[0].slider("Scan the first N stocks of your list", 10, 300, min(50, max(10, len(symbols))), key="i_topn")
-            i_rvol = a[1].slider("Min relative volume", 1.0, 4.0, 1.5, 0.25, key="i_rvol",
-                                 help="Volume so far today vs the average at this time of day.")
-            i_fresh = a[2].slider("'Fresh' = broke out within N bars", 1, 24, 6, key="i_fresh")
-            i_near = a[3].slider("'Near trigger' within (x ATR)", 0.1, 1.5, 0.5, 0.1, key="i_near")
-            b = st.columns(4)
-            i_stop = b[0].slider("Stop = ATR multiple (max)", 1.5, 6.0, 3.0, 0.5, key="i_stop")
-            i_rr = b[1].slider("Reward : Risk", 1.0, 3.0, 1.5, 0.25, key="i_rr")
-            i_dir = b[2].radio("Direction", ["Long & short", "Long only", "Short only"], key="i_dir")
-            i_align = b[3].checkbox("Align with Nifty direction", True, key="i_align",
-                                    help="No longs when Nifty is down >0.15% on the day, no shorts when up >0.15%.")
-        i_o = dict(rvol_min=i_rvol, fresh_bars=i_fresh, near_atr=i_near, stop_atr=i_stop, rr=i_rr,
-                   longs=i_dir != "Short only", shorts=i_dir != "Long only", align_nifty=i_align)
-        if st.button("Scan now", type="primary", key="i_scan"):
-            st.session_state["intra"] = run_intraday(dict(symbols=symbols[:i_topn], o=i_o))
-        if "intra" in st.session_state:
-            render_intraday(st.session_state["intra"])
-        else:
-            st.write("Press **Scan now**.")
 
-        st.divider()
-        st.subheader("Backtest this intraday strategy")
-        st.caption("Uses the settings above on roughly the last 8 weeks of 5-minute data (Yahoo's limit).")
-        e = st.columns(3)
-        i_cost = e[0].slider("Round-trip cost (%)", 0.0, 0.4, 0.10, 0.02, key="i_cost",
-                             help="Brokerage + STT + charges + slippage as % of trade value.")
-        i_cut = e[1].selectbox("No new entries after", ["13:30", "14:30"], index=1, key="i_cut")
-        if e[2].button("Run intraday backtest", key="i_bt"):
-            hh, mm = (int(x) for x in i_cut.split(":"))
-            st.session_state["intra_bt"] = run_intraday_backtest(dict(
-                symbols=symbols[:i_topn], o={**i_o, "cost_pct": i_cost, "entry_cutoff_min": hh * 60 + mm,
-                                              "squareoff_min": 15 * 60 + 15}))
-        if "intra_bt" in st.session_state:
-            render_intraday_backtest(st.session_state["intra_bt"])
+if __name__ == "__main__" and "--monitor" in sys.argv:
+    import argparse
+    import warnings
+    warnings.filterwarnings("ignore")
+    logging.getLogger("streamlit").setLevel(logging.CRITICAL)
+    logging.disable(logging.WARNING)
+    ap = argparse.ArgumentParser(description="Background position monitor")
+    ap.add_argument("--monitor", action="store_true")
+    ap.add_argument("--interval", type=int, default=120, help="seconds between checks (default 120)")
+    ap.add_argument("--once", action="store_true", help="check once and exit (for Task Scheduler / cron)")
+    args = ap.parse_args()
+    monitor_loop(args.interval, args.once)
+    sys.exit(0)
 
-with tab_bt:
-    st.write("Replays the **technical** rules on past data using your sidebar stop/target settings. "
-             "Use it to check whether the setup has had an edge before risking money.")
-    b1, b2, b3, b4 = st.columns(4)
-    years = b1.selectbox("History", ["2y", "3y", "5y"], index=1)
-    max_hold = b2.slider("Max holding days", 3, 20, 10)
-    cost = b3.slider("Round-trip cost (%)", 0.0, 0.6, 0.15, 0.05,
-                     help="Brokerage + STT + charges + slippage, as % of trade value.")
-    thr = b4.slider("Min technical score", 30, 100, 55)
-    sweep = st.checkbox("Also test stop/target combinations (slower)", False)
-    if st.button("Run backtest"):
-        if not symbols:
-            st.warning("No stocks selected. Build the universe (or pick another option) in the sidebar.")
-        else:
-            st.session_state["bt"] = run_backtest(dict(symbols=symbols, years=years, max_hold=max_hold, cost=cost,
-                                                       thr=thr, params=params, sweep=sweep))
-    if "bt" in st.session_state:
-        render_backtest(st.session_state["bt"])
+
+# ============================================================================ trade journal UI
+def _rerun():
+    (getattr(st, "rerun", None) or st.experimental_rerun)()
+
+
+def db_backup_bytes() -> bytes:
+    """Consistent copy of the database (safe even while the background monitor is writing)."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+    tmp.close()
+    try:
+        with closing(_con()) as src, closing(sqlite3.connect(tmp.name)) as dst:
+            src.backup(dst)
+        with open(tmp.name, "rb") as fh:
+            return fh.read()
+    finally:
+        os.remove(tmp.name)
+
+
+def record_trades_ui(orders: pd.DataFrame, kind: str, signal_ids, price_col: str, stop_col: str, key: str):
+    """Tick the orders you actually traded, fix quantity / price to the real fill, save as open positions."""
+    st.subheader("Record the trades you actually took")
+    st.caption("Tick the orders you traded and correct the quantity or price to your real fill. "
+               "Saved trades appear in the Portfolio tab, where they are monitored for exit alerts.")
+    base = pd.DataFrame({
+        "Traded": False, "Symbol": orders.Symbol.values,
+        "Side": ["LONG" if str(x).startswith("BUY") else "SHORT" for x in orders.Side],
+        "Qty": orders.Qty.astype(int).values, "Fill price": orders[price_col].astype(float).values,
+        "Stop": orders[stop_col].astype(float).values, "Target": orders.Target.astype(float).values})
+    sig = hashlib.md5(base.to_csv().encode()).hexdigest()[:8]
+    cc = st.column_config
+    ed = st.data_editor(base, key=f"rec_{key}_{sig}", hide_index=True, disabled=["Symbol", "Side"], column_config={
+        "Traded": cc.CheckboxColumn("Traded?"),
+        "Qty": cc.NumberColumn("Qty", min_value=1, step=1, format="%d"),
+        "Fill price": cc.NumberColumn("Fill price", min_value=0.05, step=0.05, format="%.2f"),
+        "Stop": cc.NumberColumn("Stop", min_value=0.05, step=0.05, format="%.2f"),
+        "Target": cc.NumberColumn("Target", min_value=0.05, step=0.05, format="%.2f")})
+    c = st.columns(3)
+    d = c[0].date_input("Trade date", value=now_ist().date(), key=f"rec_d_{key}")
+    t = c[1].time_input("Trade time (IST)", value=now_ist().time().replace(second=0, microsecond=0), key=f"rec_t_{key}")
+    if c[2].button("Save ticked rows as open positions", key=f"rec_go_{key}"):
+        chosen = ed[ed.Traded]
+        if chosen.empty:
+            st.warning("Tick at least one order first.")
+            return
+        opened, saved, errs = pd.Timestamp.combine(d, t), 0, []
+        for _, r in chosen.iterrows():
+            try:
+                add_position(r.Symbol, r.Side, kind, int(r.Qty), float(r["Fill price"]), float(r.Stop),
+                             float(r.Target), (signal_ids or {}).get(r.Symbol), "", opened)
+                saved += 1
+            except (ValueError, TypeError) as ex:
+                errs.append(str(ex))
+        if saved:
+            st.success(f"Saved {saved} open position(s). They are now tracked in the Portfolio tab.")
+        for e in errs:
+            st.error(e)
+
+
+def _alerts_panel():
+    if st.session_state.get("mon_auto"):
+        try:
+            res = monitor_once()
+            for a in res["new"]:
+                if hasattr(st, "toast"):
+                    st.toast(a["message"], icon=ALERT_ICON.get(a["type"], "⚠️"))
+        except Exception as ex:
+            st.caption(f"Auto-check failed: {type(ex).__name__}: {str(ex)[:100]}")
+    rows = db_all("SELECT a.*, p.symbol, p.qty, p.status FROM alerts a LEFT JOIN positions p ON p.id=a.position_id "
+                  "WHERE a.acked=0 ORDER BY a.id DESC LIMIT 100")
+    if not rows:
+        s
